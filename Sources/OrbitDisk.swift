@@ -706,8 +706,24 @@ struct ContentView: View {
 }
 
 #if !TESTING
+@MainActor
+final class OrbitDiskAppDelegate: NSObject, NSApplicationDelegate {
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        // Set the running app's Dock image as well as its bundle icon. This
+        // refreshes icons cached from earlier locally built app bundles.
+        NSApp.setActivationPolicy(.regular)
+        if let url = Bundle.main.url(forResource: "OrbitDisk", withExtension: "icns"),
+           let icon = NSImage(contentsOf: url) {
+            NSApp.applicationIconImage = icon
+            NSApp.dockTile.display()
+        }
+    }
+}
+
 @main
 struct OrbitDiskApp: App {
+    @NSApplicationDelegateAdaptor(OrbitDiskAppDelegate.self) private var appDelegate
+
     var body: some Scene {
         WindowGroup("OrbitDisk") { ContentView() }
             .windowStyle(.hiddenTitleBar)
