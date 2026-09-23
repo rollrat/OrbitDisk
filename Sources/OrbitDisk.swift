@@ -446,7 +446,7 @@ private struct MapViewport {
     }
 }
 
-// Scoped to the large chart: no global event monitor or scroll interception in the sidebar/menu.
+// Scoped to each chart: no global event monitor or scroll interception in surrounding lists.
 private struct MapInput: NSViewRepresentable {
     var zoom: (CGFloat, CGPoint) -> Void
     var pan: (CGSize) -> Void
@@ -530,14 +530,26 @@ private struct MapInput: NSViewRepresentable {
 
 private struct MapSurface {
     static let sidebarWidth: CGFloat = 352
+    static let menuSize = CGSize(width: 400, height: 680)
+    static let menuPanelHeight: CGFloat = 272
     let size: CGSize
     let floating: Bool
+    var compact = false
+    var menuNavigationFrame: CGRect { CGRect(x: 12, y: 70, width: size.width - 24, height: 34) }
+    var menuPanelFrame: CGRect { CGRect(x: 12, y: size.height - Self.menuPanelHeight - 12,
+                                       width: size.width - 24, height: Self.menuPanelHeight) }
     var mapFrame: CGRect {
-        floating ? CGRect(x: 16, y: 76, width: max(1, size.width - 416), height: max(1, size.height - 144))
+        if floating && compact {
+            return CGRect(x: 16, y: 88, width: max(1, size.width - 32), height: max(1, menuPanelFrame.minY - 76))
+        }
+        return floating ? CGRect(x: 16, y: 76, width: max(1, size.width - 416), height: max(1, size.height - 144))
                  : CGRect(origin: .zero, size: size)
     }
     var blockedRects: [CGRect] {
         guard floating else { return [] }
+        if compact {
+            return [CGRect(x: 0, y: 0, width: size.width, height: 60), menuNavigationFrame, menuPanelFrame]
+        }
         return [CGRect(x: 0, y: 0, width: size.width, height: 52),
                 CGRect(x: 0, y: size.height - 44, width: size.width, height: 44),
                 CGRect(x: size.width - Self.sidebarWidth - 16, y: 68,
@@ -584,7 +596,7 @@ private struct MapView: View {
     @Binding var viewport: MapViewport
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     init(model: DiskViewModel, focus: DiskNode, compact: Bool = false, floating: Bool = false,
-         viewport: Binding<MapViewport> = .constant(MapViewport())) {
+         viewport: Binding<MapViewport>) {
         self.model = model
         self.focus = focus
         self.compact = compact
@@ -596,14 +608,14 @@ private struct MapView: View {
     private var visibleSlices: [RingSlice] { model.slices.filter { $0.depth < boundaries.count - 1 } }
     var body: some View {
         Group {
-            if compact { chart.aspectRatio(1, contentMode: .fit) }
+            if compact && !floating { chart.aspectRatio(1, contentMode: .fit) }
             else { chart.frame(maxWidth: .infinity, maxHeight: .infinity) }
         }
     }
 
     private var chart: some View {
         GeometryReader { geo in
-            let surface = MapSurface(size: geo.size, floating: floating)
+            let surface = MapSurface(size: geo.size, floating: floating, compact: compact)
             let mapSize = surface.mapFrame.size
             ZStack {
                 Canvas { context, size in
@@ -632,20 +644,7 @@ private struct MapView: View {
                         }
                     }
                 }
-                .onContinuousHover { phase in
-                    guard compact else { return }
-                    switch phase {
-                    case .active(let location): model.hover(RingLayout.hit(location, size: geo.size, slices: visibleSlices, boundaries: boundaries))
-                    case .ended: model.hover(nil)
-                    }
-                }
-                .gesture(SpatialTapGesture().onEnded { value in
-                    guard compact else { return }
-                    if let slice = RingLayout.hit(value.location, size: geo.size, slices: visibleSlices, boundaries: boundaries) {
-                        withAnimation(reduceMotion ? nil : .easeInOut(duration: 0.20)) { model.activate(slice) }
-                    } else { model.resetSelection() }
-                })
-                .allowsHitTesting(compact)
+                .allowsHitTesting(false)
                 .accessibilityLabel("폴더 용량 지도. 목록에서도 각 항목을 탐색할 수 있습니다.")
                 Button {
                     withAnimation(reduceMotion ? nil : .easeInOut(duration: 0.20)) { model.up() }
@@ -668,24 +667,22 @@ private struct MapView: View {
                 }
                 .buttonStyle(.plain).help(focus.parent == nil ? "현재 스캔의 시작 폴더" : "중심을 클릭하면 상위 폴더로 이동합니다")
                 .accessibilityLabel(focus.parent == nil ? "현재 폴더 용량" : "상위 폴더로 이동")
-                .allowsHitTesting(compact)
+                .allowsHitTesting(false)
                 .offset(x: viewport.offset.width + surface.mapFrame.midX - geo.size.width / 2,
                         y: viewport.offset.height + surface.mapFrame.midY - geo.size.height / 2)
 
-                if !compact {
-                    MapInput(
-                        zoom: { factor, point in viewport.zoom(by: factor, at: surface.localPoint(point), size: mapSize) },
-                        pan: { delta in viewport.pan(by: delta, size: mapSize) },
-                        click: { point in activate(at: surface.localPoint(point), size: mapSize) },
-                        hover: { point in
-                            model.hover(point.flatMap {
-                                RingLayout.hit(viewport.mapPoint(surface.localPoint($0), size: mapSize), size: mapSize,
-                                               slices: visibleSlices, boundaries: boundaries)
-                            })
-                        },
-                        blockedRects: surface.blockedRects
-                    ).accessibilityHidden(true)
-                }
+                MapInput(
+                    zoom: { factor, point in viewport.zoom(by: factor, at: surface.localPoint(point), size: mapSize) },
+                    pan: { delta in viewport.pan(by: delta, size: mapSize) },
+                    click: { point in activate(at: surface.localPoint(point), size: mapSize) },
+                    hover: { point in
+                        model.hover(point.flatMap {
+                            RingLayout.hit(viewport.mapPoint(surface.localPoint($0), size: mapSize), size: mapSize,
+                                           slices: visibleSlices, boundaries: boundaries)
+                        })
+                    },
+                    blockedRects: surface.blockedRects
+                ).accessibilityHidden(true)
             }
             .clipped()
             .overlay(alignment: .topTrailing) {
@@ -704,6 +701,7 @@ private struct MapView: View {
                         }.buttonStyle(.plain).foregroundStyle(Theme.muted)
                             .help("원래 크기와 위치로 · 100%")
                             .accessibilityLabel("지도 원래 크기와 위치로 복원")
+                            .accessibilityValue("\(Int((viewport.scale * 100).rounded()))%")
                         SmallIconButton(symbol: "plus", help: "지도 확대", disabled: viewport.scale >= MapViewport.limits.upperBound) {
                             zoom(by: 1.25, size: mapSize)
                         }
@@ -713,7 +711,7 @@ private struct MapView: View {
                     .padding(.top, floating ? 70 : 8)
                 }
             }
-            .onChange(of: geo.size) { size in viewport.constrain(to: MapSurface(size: size, floating: floating).mapFrame.size) }
+            .onChange(of: geo.size) { size in viewport.constrain(to: MapSurface(size: size, floating: floating, compact: compact).mapFrame.size) }
         }
     }
 
@@ -1110,101 +1108,126 @@ private struct HomeMenuView: View {
     @ObservedObject var windowModel: DiskViewModel
     @Environment(\.openWindow) private var openWindow
     private let home = FileManager.default.homeDirectoryForCurrentUser
+    @State private var mapViewport = MapViewport()
 
     var body: some View {
-        VStack(spacing: 0) {
-            HStack(spacing: 9) {
-                Image(systemName: "chart.pie.fill").foregroundStyle(Theme.accent)
-                VStack(alignment: .leading, spacing: 3) {
-                    Text("OrbitDisk").font(.system(size: 14, weight: .semibold))
-                    Text("홈 폴더 · \(home.lastPathComponent)").font(.system(size: 10)).foregroundStyle(Theme.muted)
-                }
-                Spacer()
-                if model.scanning {
-                    SmallIconButton(symbol: "xmark", help: "홈 폴더 스캔 취소") { model.cancel() }
-                } else {
-                    SmallIconButton(symbol: "arrow.clockwise", help: "홈 폴더 다시 스캔") { model.start(home) }
-                }
-                Menu {
-                    Button("Finder에서 홈 폴더 열기") { NSWorkspace.shared.open(home) }
-                    Divider()
-                    Button("OrbitDisk 종료") { NSApp.terminate(nil) }
-                } label: { Image(systemName: "ellipsis").frame(width: 20, height: 24) }
-                .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize()
-                .accessibilityLabel("OrbitDisk 메뉴")
-            }.padding(.horizontal, 18).padding(.vertical, 14)
-            Rectangle().fill(Theme.line).frame(height: 1)
+        ZStack {
+            if let focus = model.focus {
+                MapView(model: model, focus: focus, compact: true, floating: true, viewport: $mapViewport)
+                    .opacity(model.scanning ? 0.3 : 1)
+                    .allowsHitTesting(!model.scanning)
+                    .overlay { if model.scanning { ProgressView().controlSize(.small) } }
+            } else {
+                emptyState.padding(.bottom, MapSurface.menuPanelHeight / 2)
+            }
+        }
+        .frame(width: MapSurface.menuSize.width, height: MapSurface.menuSize.height)
+        .background(Theme.background)
+        .overlay(alignment: .top) {
+            header.frame(height: 60).background { GlassPanel(radius: 0) }
+        }
+        .overlay(alignment: .top) {
+            breadcrumbs.padding(.horizontal, 12).frame(height: 34)
+                .background { GlassPanel(radius: 10) }
+                .padding(.horizontal, 12).padding(.top, 70)
+        }
+        .overlay(alignment: .bottom) {
+            details.padding(12).frame(height: MapSurface.menuPanelHeight)
+                .background { GlassPanel(radius: 16) }
+                .shadow(color: .black.opacity(0.2), radius: 12, y: 5)
+                .padding(12)
+        }
+        .clipped().preferredColorScheme(.dark)
+        .onAppear {
+            if model.root == nil && !model.scanning { model.start(home) }
+            else if let root = model.root, !model.scanning { model.open(root) }
+        }
+        .onDisappear { model.resetSelection() }
+    }
 
-            VStack(spacing: 8) {
-                HStack(spacing: 7) {
-                    Button {
-                        if let root = model.root { model.open(root) }
-                    } label: { Label("홈", systemImage: "house") }
-                    .buttonStyle(.plain).foregroundStyle(Theme.accent)
-                    .disabled(model.root == nil || model.scanning)
-                    if let focus = model.focus, focus !== model.root {
-                        Image(systemName: "chevron.right").foregroundStyle(Theme.muted)
-                        Text(focus.name).lineLimit(1).truncationMode(.middle)
-                        Spacer(minLength: 0)
-                        SmallIconButton(symbol: "arrow.up", help: "상위 폴더") { model.up() }
-                            .disabled(model.scanning)
-                    } else { Spacer() }
-                    Text("읽힌 파일 합계").foregroundStyle(Theme.muted)
-                }.font(.system(size: 11)).frame(height: 26)
+    private var header: some View {
+        HStack(spacing: 9) {
+            Image(systemName: "chart.pie.fill").foregroundStyle(Theme.accent)
+            VStack(alignment: .leading, spacing: 3) {
+                Text("OrbitDisk").font(.system(size: 14, weight: .semibold))
+                Text("홈 폴더 · \(home.lastPathComponent)").font(.system(size: 10)).foregroundStyle(Theme.muted)
+            }
+            Spacer()
+            if model.scanning {
+                SmallIconButton(symbol: "xmark", help: "홈 폴더 스캔 취소") { model.cancel() }
+            } else {
+                SmallIconButton(symbol: "arrow.clockwise", help: "홈 폴더 다시 스캔") { model.start(home) }
+            }
+            Menu {
+                Button("Finder에서 홈 폴더 열기") { NSWorkspace.shared.open(home) }
+                Divider()
+                Button("OrbitDisk 종료") { NSApp.terminate(nil) }
+            } label: { Image(systemName: "ellipsis").frame(width: 20, height: 24) }
+            .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize()
+            .accessibilityLabel("OrbitDisk 메뉴")
+        }.padding(.horizontal, 18)
+    }
 
-                if let focus = model.focus {
-                    MapView(model: model, focus: focus, compact: true)
-                        .frame(width: 236, height: 236)
-                        .opacity(model.scanning ? 0.3 : 1)
-                        .allowsHitTesting(!model.scanning)
-                        .overlay { if model.scanning { ProgressView().controlSize(.small) } }
-                    Text(model.hoveredSlice?.name ?? model.activeNode?.name ?? (focus === model.root ? "홈 폴더" : focus.name))
-                        .font(.system(size: 12, weight: .medium)).lineLimit(1).truncationMode(.middle)
-                        .frame(height: 18)
-                    HStack {
-                        Text(model.smallItems == nil ? "용량이 큰 항목" : "작은 항목")
-                        Spacer()
-                        Text("\(model.listedItems.count.formatted())개")
-                    }.font(.system(size: 10)).foregroundStyle(Theme.muted).padding(.top, 4)
-                    VStack(spacing: 1) {
-                        ForEach(model.listedItems.prefix(4)) { FileRow(model: model, node: $0) }
-                        if model.listedItems.isEmpty {
-                            Text(focus.skipped > 0 ? "접근 권한이 필요한 폴더입니다" : "표시할 파일이 없습니다")
-                                .font(.system(size: 12)).foregroundStyle(Theme.muted).padding(.vertical, 24)
-                        }
-                    }.disabled(model.scanning)
-                } else {
-                    VStack(spacing: 14) {
-                        if model.scanning {
-                            ProgressView().controlSize(.small)
-                            Text("홈 폴더를 살펴보는 중").font(.system(size: 15, weight: .medium))
-                            Text("\(model.scannedFiles.formatted())개 파일 · \(formattedSize(model.scannedBytes))")
-                                .font(.system(size: 12, design: .rounded)).foregroundStyle(Theme.accent)
-                            Text("메뉴를 닫아도 스캔은 계속됩니다")
-                                .font(.system(size: 11)).foregroundStyle(Theme.muted)
-                        } else {
-                            Image(systemName: "house.circle").font(.system(size: 48, weight: .ultraLight)).foregroundStyle(Theme.accent)
-                            Text("홈 폴더의 공간을 한눈에").font(.system(size: 15, weight: .medium))
-                            Button("홈 폴더 스캔") { model.start(home) }.buttonStyle(.bordered)
-                        }
-                    }.frame(maxWidth: .infinity, maxHeight: .infinity)
-                }
+    private var breadcrumbs: some View {
+        HStack(spacing: 7) {
+            Button {
+                if let root = model.root { model.open(root) }
+            } label: { Label("홈", systemImage: "house") }
+            .buttonStyle(.plain).foregroundStyle(Theme.accent)
+            .disabled(model.root == nil || model.scanning)
+            if let focus = model.focus, focus !== model.root {
+                Image(systemName: "chevron.right").foregroundStyle(Theme.muted)
+                Text(focus.name).lineLimit(1).truncationMode(.middle)
                 Spacer(minLength: 0)
-                HStack(spacing: 4) {
-                    if model.scanning {
-                        Text("스캔 중 · \(model.scannedFiles.formatted())개 파일")
-                    } else if let date = model.lastScannedAt {
-                        Text("업데이트")
-                        Text(date, style: .time)
-                    } else { Text("홈 폴더만 스캔합니다") }
-                    Spacer(minLength: 0)
-                    if let root = model.root, root.skipped > 0 {
-                        Label("제한 \(root.skipped)개", systemImage: "lock")
-                            .help("읽지 못한 항목은 합계에서 제외됩니다. 전체 디스크 사용량과 다릅니다.")
-                    }
-                }.font(.system(size: 10)).foregroundStyle(Theme.muted)
-            }.padding(.horizontal, 18).padding(.vertical, 12)
+                SmallIconButton(symbol: "arrow.up", help: "상위 폴더") { model.up() }.disabled(model.scanning)
+            } else { Spacer() }
+            Text("읽힌 파일 합계").foregroundStyle(Theme.muted)
+        }.font(.system(size: 11))
+    }
 
+    private var details: some View {
+        VStack(spacing: 6) {
+            HStack(spacing: 8) {
+                Text(model.hoveredSlice?.name ?? model.activeNode?.name ?? model.focus.map { $0 === model.root ? "홈 폴더" : $0.name } ?? "홈 폴더")
+                    .font(.system(size: 12, weight: .medium)).lineLimit(1).truncationMode(.middle)
+                Spacer(minLength: 0)
+                Button {
+                    mapViewport = MapViewport()
+                    model.hover(nil)
+                } label: {
+                    Text("\(Int((mapViewport.scale * 100).rounded()))%")
+                        .font(.system(size: 10, weight: .medium, design: .monospaced))
+                        .padding(.horizontal, 7).frame(height: 22)
+                        .background(RoundedRectangle(cornerRadius: 5).fill(Color.white.opacity(0.065)))
+                }.buttonStyle(.plain).foregroundStyle(Theme.muted)
+                    .help("스크롤로 확대·축소, 드래그로 이동 · 클릭하면 원래 크기와 위치로")
+                    .accessibilityLabel("미니 지도 원래 크기와 위치로 복원")
+                    .accessibilityValue("\(Int((mapViewport.scale * 100).rounded()))%")
+                    .disabled(model.scanning)
+            }.frame(height: 22)
+            HStack {
+                Text(model.smallItems == nil ? "용량이 큰 항목" : "작은 항목")
+                Spacer()
+                Text("\(model.listedItems.count.formatted())개")
+            }.font(.system(size: 10)).foregroundStyle(Theme.muted)
+            VStack(spacing: 1) {
+                ForEach(model.listedItems.prefix(4)) { FileRow(model: model, node: $0) }
+                if model.listedItems.isEmpty {
+                    Text(model.scanning ? "스캔 결과를 기다리는 중" : (model.focus?.skipped ?? 0) > 0 ? "접근 권한이 필요한 폴더입니다" : "표시할 파일이 없습니다")
+                        .font(.system(size: 12)).foregroundStyle(Theme.muted).padding(.vertical, 24)
+                }
+            }.frame(height: 131, alignment: .top).disabled(model.scanning)
+            Spacer(minLength: 0)
+            HStack(spacing: 4) {
+                if model.scanning { Text("스캔 중 · \(model.scannedFiles.formatted())개 파일") }
+                else if let date = model.lastScannedAt { Text("업데이트"); Text(date, style: .time) }
+                else { Text("홈 폴더만 스캔합니다") }
+                Spacer(minLength: 0)
+                if let root = model.root, root.skipped > 0 {
+                    Label("제한 \(root.skipped)개", systemImage: "lock")
+                        .help("읽지 못한 항목은 합계에서 제외됩니다. 전체 디스크 사용량과 다릅니다.")
+                }
+            }.font(.system(size: 10)).foregroundStyle(Theme.muted)
             Rectangle().fill(Theme.line).frame(height: 1)
             Button(action: showMainWindow) {
                 HStack {
@@ -1212,16 +1235,25 @@ private struct HomeMenuView: View {
                     Spacer()
                     Image(systemName: "arrow.up.forward.square")
                 }.font(.system(size: 12, weight: .medium)).foregroundStyle(Theme.accent)
-                    .padding(.horizontal, 20).frame(height: 45).contentShape(Rectangle())
+                    .frame(height: 32).contentShape(Rectangle())
             }.buttonStyle(.plain)
         }
-        .frame(width: 360, height: 620)
-        .background(Theme.background).preferredColorScheme(.dark)
-        .onAppear {
-            if model.root == nil && !model.scanning { model.start(home) }
-            else if let root = model.root, !model.scanning { model.open(root) }
-        }
-        .onDisappear { model.resetSelection() }
+    }
+
+    private var emptyState: some View {
+        VStack(spacing: 14) {
+            if model.scanning {
+                ProgressView().controlSize(.small)
+                Text("홈 폴더를 살펴보는 중").font(.system(size: 15, weight: .medium))
+                Text("\(model.scannedFiles.formatted())개 파일 · \(formattedSize(model.scannedBytes))")
+                    .font(.system(size: 12, design: .rounded)).foregroundStyle(Theme.accent)
+                Text("메뉴를 닫아도 스캔은 계속됩니다").font(.system(size: 11)).foregroundStyle(Theme.muted)
+            } else {
+                Image(systemName: "house.circle").font(.system(size: 48, weight: .ultraLight)).foregroundStyle(Theme.accent)
+                Text("홈 폴더의 공간을 한눈에").font(.system(size: 15, weight: .medium))
+                Button("홈 폴더 스캔") { model.start(home) }.buttonStyle(.bordered)
+            }
+        }.frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
     private func showMainWindow() {

@@ -63,6 +63,20 @@ struct Checks {
             precondition(RingLayout.path(slice, size: compactSize, boundaries: RingLayout.compactBoundaries).contains(point))
         }
         precondition(RingLayout.hit(CGPoint(x: 132, y: 132), size: compactSize, slices: compactSlices, boundaries: RingLayout.compactBoundaries) == nil)
+        var miniViewport = MapViewport()
+        let miniAnchor = CGPoint(x: 170, y: 95)
+        miniViewport.zoom(by: 2.75, at: miniAnchor, size: compactSize)
+        let anchoredMini = miniViewport.mapPoint(miniAnchor, size: compactSize)
+        precondition(hypot(anchoredMini.x - miniAnchor.x, anchoredMini.y - miniAnchor.y) < 0.000001)
+        miniViewport.pan(by: CGSize(width: 25, height: -18), size: compactSize)
+        for slice in compactSlices {
+            let angle = (slice.start + slice.end) / 2
+            let radius = 132 * (RingLayout.compactBoundaries[slice.depth] + RingLayout.compactBoundaries[slice.depth + 1]) / 2
+            let screenPoint = CGPoint(x: 132 + radius * cos(angle) * miniViewport.scale + miniViewport.offset.width,
+                                      y: 132 + radius * sin(angle) * miniViewport.scale + miniViewport.offset.height)
+            precondition(RingLayout.hit(miniViewport.mapPoint(screenPoint, size: compactSize), size: compactSize,
+                                       slices: compactSlices, boundaries: RingLayout.compactBoundaries)?.id == slice.id)
+        }
         var chain = node("end", size: 100)
         for i in 0..<10 { chain = node("depth\(i)", children: [chain]) }
         precondition(RingLayout.make(chain).count == 7)
@@ -126,6 +140,14 @@ struct Checks {
         precondition(surface.blockedRects.contains { $0.contains(CGPoint(x: 1200, y: 400)) })
         let compactSurface = MapSurface(size: compactSize, floating: false)
         precondition(compactSurface.mapFrame == CGRect(origin: .zero, size: compactSize) && compactSurface.blockedRects.isEmpty)
+        let menuSurface = MapSurface(size: MapSurface.menuSize, floating: true, compact: true)
+        precondition(menuSurface.mapFrame.width == 368 && menuSurface.mapFrame.height == 320)
+        precondition(!menuSurface.blockedRects.contains { $0.contains(CGPoint(x: 5, y: 300)) })
+        precondition(menuSurface.blockedRects.contains { $0.contains(CGPoint(x: 200, y: 85)) })
+        precondition(menuSurface.blockedRects.contains { $0.contains(CGPoint(x: 200, y: 600)) })
+        let menuCenter = CGPoint(x: menuSurface.mapFrame.midX, y: menuSurface.mapFrame.midY)
+        let menuLocalCenter = menuSurface.localPoint(menuCenter)
+        precondition(menuLocalCenter == CGPoint(x: 184, y: 160))
         let model = DiskViewModel()
         model.root = root
         model.open(root)
@@ -164,6 +186,6 @@ struct Checks {
         try await Task.sleep(nanoseconds: 300_000_000)
         precondition(!model.scanning && model.root === root && model.lastScannedAt == scannedAt)
         precondition(model.scanURL == root.url)
-        print("PASS: angular coverage, aggregation, full/compact hit testing, zoom anchor and transformed hit testing, adaptive zoom labels, floating canvas framing, \(labelCount) label bounds and orientations, history, scanner, cancellation, shared snapshots")
+        print("PASS: angular coverage, aggregation, full/compact hit testing, full/mini zoom anchors and transformed hit testing, adaptive zoom labels, window/menu floating canvas framing, \(labelCount) label bounds and orientations, history, scanner, cancellation, shared snapshots")
     }
 }
