@@ -720,6 +720,50 @@ struct ContentView: View {
     }
 }
 
+private enum MenuBarBadge {
+    // A template image keeps the small two-line readout crisp and lets macOS
+    // supply the correct foreground color for every menu bar appearance.
+    static func image(bytes: Int64?, capacity: Int64, scanning: Bool) -> NSImage {
+        let units: [(String, Double)] = [("TB", 1e12), ("GB", 1e9), ("MB", 1e6), ("KB", 1e3)]
+        let unit = units.first { Double(bytes ?? 0) >= $0.1 } ?? ("B", 1)
+        let number = bytes.map { (Double($0) / unit.1).formatted(.number.precision(.fractionLength(unit.0 == "B" ? 0 : 1))) } ?? "—"
+        let caption = bytes == nil ? (scanning ? "SCANNING" : "HOME") : "\(unit.0) · HOME"
+        let numberAttributes: [NSAttributedString.Key: Any] = [
+            .font: NSFont.monospacedDigitSystemFont(ofSize: 10.5, weight: .medium),
+            .foregroundColor: NSColor.black
+        ]
+        let captionAttributes: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(ofSize: 6.5, weight: .medium),
+            .foregroundColor: NSColor.black.withAlphaComponent(0.8),
+            .kern: 0.35
+        ]
+        let textWidth = ceil(max((number as NSString).size(withAttributes: numberAttributes).width,
+                                 (caption as NSString).size(withAttributes: captionAttributes).width))
+        let image = NSImage(size: NSSize(width: 20 + textWidth, height: 18), flipped: false) { _ in
+            let ring = NSBezierPath(ovalIn: NSRect(x: 1, y: 2, width: 14, height: 14))
+            ring.lineWidth = 1.25
+            NSColor.black.withAlphaComponent(0.30).setStroke()
+            ring.stroke()
+            let fraction = bytes.map { min(1, max(0, Double($0) / Double(max(capacity, 1)))) } ?? 0.22
+            let arc = NSBezierPath()
+            arc.appendArc(withCenter: NSPoint(x: 8, y: 9), radius: 7, startAngle: 90,
+                          endAngle: CGFloat(90 - 360 * max(fraction, 0.015)), clockwise: true)
+            arc.lineWidth = 1.7
+            arc.lineCapStyle = .round
+            NSColor.black.setStroke()
+            arc.stroke()
+            NSColor.black.withAlphaComponent(scanning ? 0.4 : 0.9).setFill()
+            NSBezierPath(ovalIn: NSRect(x: 6.5, y: 7.5, width: 3, height: 3)).fill()
+            (number as NSString).draw(at: NSPoint(x: 20, y: 6), withAttributes: numberAttributes)
+            (caption as NSString).draw(at: NSPoint(x: 20, y: -0.5), withAttributes: captionAttributes)
+            return true
+        }
+        image.isTemplate = true
+        image.accessibilityDescription = bytes.map { "홈 폴더 \(formattedSize($0))" } ?? (scanning ? "홈 폴더 스캔 중" : "홈 폴더 스캔 필요")
+        return image
+    }
+}
+
 private struct HomeMenuView: View {
     @ObservedObject var model: DiskViewModel
     @ObservedObject var windowModel: DiskViewModel
@@ -874,8 +918,18 @@ struct OrbitDiskApp: App {
         Window("OrbitDisk", id: "main") { ContentView(model: windowModel) }
             .windowStyle(.hiddenTitleBar)
             .defaultSize(width: 1100, height: 740)
-        MenuBarExtra("OrbitDisk", systemImage: "chart.pie") {
+        MenuBarExtra {
             HomeMenuView(model: homeModel, windowModel: windowModel)
+        } label: {
+            Image(nsImage: MenuBarBadge.image(bytes: homeModel.root?.bytes,
+                                             capacity: homeModel.volumes.first?.total ?? 1,
+                                             scanning: homeModel.scanning))
+            .help("홈 폴더에서 읽힌 파일 합계 · 원형 게이지는 디스크 전체 용량 대비 비율 · 클릭해서 자세히 보기")
+            .task {
+                if homeModel.root == nil && !homeModel.scanning {
+                    homeModel.start(FileManager.default.homeDirectoryForCurrentUser)
+                }
+            }
         }
         .menuBarExtraStyle(.window)
     }
