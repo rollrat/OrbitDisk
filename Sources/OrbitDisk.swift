@@ -404,21 +404,209 @@ final class DiskViewModel: ObservableObject {
     func resetSelection() { selected = nil; hovered = nil; hoveredSlice = nil }
 }
 
+// Screen = (map point - viewport center) * scale + viewport center + offset.
+private struct MapViewport {
+    static let limits: ClosedRange<CGFloat> = 0.5...6
+    var scale: CGFloat = 1
+    var offset = CGSize.zero
+
+    func mapPoint(_ point: CGPoint, size: CGSize) -> CGPoint {
+        CGPoint(x: (point.x - size.width / 2 - offset.width) / scale + size.width / 2,
+                y: (point.y - size.height / 2 - offset.height) / scale + size.height / 2)
+    }
+
+    mutating func zoom(by factor: CGFloat, at point: CGPoint, size: CGSize) {
+        guard factor.isFinite, factor > 0 else { return }
+        let next = min(Self.limits.upperBound, max(Self.limits.lowerBound, scale * factor))
+        let ratio = next / scale
+        offset.width = point.x - size.width / 2 - (point.x - size.width / 2 - offset.width) * ratio
+        offset.height = point.y - size.height / 2 - (point.y - size.height / 2 - offset.height) * ratio
+        scale = next
+        constrain(to: size)
+    }
+
+    mutating func pan(by delta: CGSize, size: CGSize) {
+        offset.width += delta.width
+        offset.height += delta.height
+        constrain(to: size)
+    }
+
+    mutating func constrain(to size: CGSize) {
+        // Keep at least a small part of the map within reach after dragging.
+        let radius = min(size.width, size.height) * 0.5 * scale * RingLayout.boundaries.last!
+        let reach = max(0, radius - 48)
+        let outsideX = max(0, abs(offset.width) - size.width / 2)
+        let outsideY = max(0, abs(offset.height) - size.height / 2)
+        let distance = hypot(outsideX, outsideY)
+        if distance > reach {
+            let ratio = reach / distance
+            if outsideX > 0 { offset.width = (offset.width < 0 ? -1 : 1) * (size.width / 2 + outsideX * ratio) }
+            if outsideY > 0 { offset.height = (offset.height < 0 ? -1 : 1) * (size.height / 2 + outsideY * ratio) }
+        }
+    }
+}
+
+// Scoped to the large chart: no global event monitor or scroll interception in the sidebar/menu.
+private struct MapInput: NSViewRepresentable {
+    var zoom: (CGFloat, CGPoint) -> Void
+    var pan: (CGSize) -> Void
+    var click: (CGPoint) -> Void
+    var hover: (CGPoint?) -> Void
+    var blockedRects: [CGRect] = []
+
+    func makeNSView(context: Context) -> InputView { InputView() }
+    func updateNSView(_ view: InputView, context: Context) {
+        view.zoom = zoom; view.pan = pan; view.click = click; view.hover = hover
+        view.blockedRects = blockedRects
+    }
+
+    final class InputView: NSView {
+        var zoom: (CGFloat, CGPoint) -> Void = { _, _ in }
+        var pan: (CGSize) -> Void = { _ in }
+        var click: (CGPoint) -> Void = { _ in }
+        var hover: (CGPoint?) -> Void = { _ in }
+        var blockedRects: [CGRect] = []
+        private var tracking: NSTrackingArea?
+        private var down: CGPoint?
+        private var previous: CGPoint?
+        private var dragged = false
+        override var isFlipped: Bool { true }
+        override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+        override func hitTest(_ point: NSPoint) -> NSView? {
+            let local = convert(point, from: superview)
+            guard !blockedRects.contains(where: { $0.contains(local) }) else { return nil }
+            return super.hitTest(point)
+        }
+        private func hoverPoint(_ event: NSEvent) {
+            let local = point(event)
+            hover(blockedRects.contains(where: { $0.contains(local) }) ? nil : local)
+        }
+        override func updateTrackingAreas() {
+            super.updateTrackingAreas()
+            if let tracking { removeTrackingArea(tracking) }
+            let area = NSTrackingArea(rect: bounds, options: [.mouseMoved, .mouseEnteredAndExited, .activeInKeyWindow, .inVisibleRect], owner: self)
+            addTrackingArea(area)
+            tracking = area
+        }
+        override func resetCursorRects() { addCursorRect(bounds, cursor: .openHand) }
+        private func point(_ event: NSEvent) -> CGPoint { convert(event.locationInWindow, from: nil) }
+        override func scrollWheel(with event: NSEvent) {
+            let delta = event.scrollingDeltaY * (event.hasPreciseScrollingDeltas ? 0.008 : 0.10)
+            guard delta != 0 else { return }
+            zoom(CGFloat(exp(Double(min(0.5, max(-0.5, delta))))), point(event))
+            hover(point(event))
+        }
+        override func magnify(with event: NSEvent) {
+            zoom(max(0.1, 1 + event.magnification), point(event))
+            hover(point(event))
+        }
+        override func mouseEntered(with event: NSEvent) { hoverPoint(event) }
+        override func mouseMoved(with event: NSEvent) { hoverPoint(event) }
+        override func mouseExited(with event: NSEvent) { hover(nil) }
+        override func mouseDown(with event: NSEvent) {
+            down = point(event); previous = down; dragged = false
+        }
+        override func mouseDragged(with event: NSEvent) {
+            guard let down, let previous else { return }
+            let current = point(event)
+            if !dragged && hypot(current.x - down.x, current.y - down.y) < 4 { return }
+            dragged = true
+            NSCursor.closedHand.set()
+            hover(nil)
+            pan(CGSize(width: current.x - previous.x, height: current.y - previous.y))
+            self.previous = current
+        }
+        override func mouseUp(with event: NSEvent) {
+            guard down != nil else { return }
+            let current = point(event)
+            let shouldClick = !dragged
+            down = nil; previous = nil; dragged = false
+            NSCursor.openHand.set()
+            if shouldClick { click(current) }
+            else { hoverPoint(event) }
+        }
+    }
+}
+
+private struct MapSurface {
+    static let sidebarWidth: CGFloat = 352
+    let size: CGSize
+    let floating: Bool
+    var mapFrame: CGRect {
+        floating ? CGRect(x: 16, y: 76, width: max(1, size.width - 416), height: max(1, size.height - 144))
+                 : CGRect(origin: .zero, size: size)
+    }
+    var blockedRects: [CGRect] {
+        guard floating else { return [] }
+        return [CGRect(x: 0, y: 0, width: size.width, height: 52),
+                CGRect(x: 0, y: size.height - 44, width: size.width, height: 44),
+                CGRect(x: size.width - Self.sidebarWidth - 16, y: 68,
+                       width: Self.sidebarWidth, height: max(0, size.height - 128))]
+    }
+    func localPoint(_ point: CGPoint) -> CGPoint {
+        CGPoint(x: point.x - mapFrame.minX, y: point.y - mapFrame.minY)
+    }
+}
+
+private struct WindowBlur: NSViewRepresentable {
+    func makeNSView(context: Context) -> NSVisualEffectView {
+        let view = NSVisualEffectView()
+        view.blendingMode = .withinWindow
+        view.material = .hudWindow
+        view.state = .active
+        return view
+    }
+    func updateNSView(_ view: NSVisualEffectView, context: Context) {}
+}
+
+private struct GlassPanel: View {
+    var radius: CGFloat = 16
+    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
+    var body: some View {
+        ZStack {
+            if reduceTransparency { Theme.background }
+            else {
+                WindowBlur()
+                Theme.background.opacity(0.24)
+            }
+        }
+        .clipShape(RoundedRectangle(cornerRadius: radius))
+        .overlay(RoundedRectangle(cornerRadius: radius).strokeBorder(Color.white.opacity(0.09), lineWidth: 0.7))
+        .allowsHitTesting(false)
+    }
+}
+
 private struct MapView: View {
     @ObservedObject var model: DiskViewModel
     let focus: DiskNode
     var compact = false
+    var floating = false
+    @State private var viewport = MapViewport()
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     private var displayedBytes: Int64 { model.hoveredSlice?.bytes ?? model.activeNode?.bytes ?? focus.bytes }
     private var boundaries: [CGFloat] { compact ? RingLayout.compactBoundaries : RingLayout.boundaries }
     private var visibleSlices: [RingSlice] { model.slices.filter { $0.depth < boundaries.count - 1 } }
     var body: some View {
+        Group {
+            if compact { chart.aspectRatio(1, contentMode: .fit) }
+            else { chart.frame(maxWidth: .infinity, maxHeight: .infinity) }
+        }
+    }
+
+    private var chart: some View {
         GeometryReader { geo in
+            let surface = MapSurface(size: geo.size, floating: floating)
+            let mapSize = surface.mapFrame.size
             ZStack {
                 Canvas { context, size in
+                    // Rebuild paths and fit labels using actual on-screen geometry at every zoom level.
+                    // Text/strokes stay at readable point sizes as more labels become eligible.
+                    let drawingSize = CGSize(width: mapSize.width * viewport.scale, height: mapSize.height * viewport.scale)
+                    context.translateBy(x: surface.mapFrame.midX - drawingSize.width / 2 + viewport.offset.width,
+                                        y: surface.mapFrame.midY - drawingSize.height / 2 + viewport.offset.height)
                     let active = model.activeNode
                     for slice in visibleSlices {
-                        let path = RingLayout.path(slice, size: size, boundaries: boundaries)
+                        let path = RingLayout.path(slice, size: drawingSize, boundaries: boundaries)
                         let related = active == nil || slice.node.map { $0.isRelated(to: active!) } == true
                         var layer = context
                         layer.opacity = related || model.hoveredSlice?.id == slice.id ? 1 : 0.28
@@ -427,7 +615,7 @@ private struct MapView: View {
                         if (active != nil && slice.node === active) || model.hoveredSlice?.id == slice.id {
                             layer.stroke(path, with: .color(Color.white.opacity(0.85)), lineWidth: 1.35)
                         }
-                        if let label = RingLabels.place(slice, size: size, boundaries: boundaries, compact: compact) {
+                        if let label = RingLabels.place(slice, size: drawingSize, boundaries: boundaries, compact: compact) {
                             layer.clip(to: path)
                             layer.translateBy(x: label.center.x, y: label.center.y)
                             layer.rotate(by: .radians(label.rotation))
@@ -437,16 +625,19 @@ private struct MapView: View {
                     }
                 }
                 .onContinuousHover { phase in
+                    guard compact else { return }
                     switch phase {
                     case .active(let location): model.hover(RingLayout.hit(location, size: geo.size, slices: visibleSlices, boundaries: boundaries))
                     case .ended: model.hover(nil)
                     }
                 }
                 .gesture(SpatialTapGesture().onEnded { value in
+                    guard compact else { return }
                     if let slice = RingLayout.hit(value.location, size: geo.size, slices: visibleSlices, boundaries: boundaries) {
                         withAnimation(reduceMotion ? nil : .easeInOut(duration: 0.20)) { model.activate(slice) }
                     } else { model.resetSelection() }
                 })
+                .allowsHitTesting(compact)
                 .accessibilityLabel("폴더 용량 지도. 목록에서도 각 항목을 탐색할 수 있습니다.")
                 Button {
                     withAnimation(reduceMotion ? nil : .easeInOut(duration: 0.20)) { model.up() }
@@ -454,7 +645,7 @@ private struct MapView: View {
                     VStack(spacing: 3) {
                         let parts = sizeParts(displayedBytes)
                         Text(parts.0)
-                            .font(.system(size: compact ? 21 : min(23, geo.size.width * 0.038), weight: .medium, design: .rounded))
+                            .font(.system(size: (compact ? 21 : min(23, geo.size.width * 0.038)), weight: .medium, design: .rounded))
                             .minimumScaleFactor(0.65).lineLimit(1)
                         Text(parts.1).font(.system(size: 11)).foregroundStyle(Theme.muted)
                         if focus.parent != nil {
@@ -462,16 +653,77 @@ private struct MapView: View {
                         }
                     }
                     .foregroundStyle(model.activeNode.map { model.color(for: $0) } ?? Theme.accent)
-                    .frame(width: min(geo.size.width, geo.size.height) * (compact ? 0.28 : 0.135),
-                           height: min(geo.size.width, geo.size.height) * (compact ? 0.28 : 0.135))
+                    .frame(width: min(mapSize.width, mapSize.height) * (compact ? 0.28 : 0.135) * viewport.scale,
+                           height: min(mapSize.width, mapSize.height) * (compact ? 0.28 : 0.135) * viewport.scale)
                     .background(Circle().fill(Theme.background))
                     .contentShape(Circle())
                 }
                 .buttonStyle(.plain).help(focus.parent == nil ? "현재 스캔의 시작 폴더" : "중심을 클릭하면 상위 폴더로 이동합니다")
                 .accessibilityLabel(focus.parent == nil ? "현재 폴더 용량" : "상위 폴더로 이동")
+                .allowsHitTesting(compact)
+                .offset(x: viewport.offset.width + surface.mapFrame.midX - geo.size.width / 2,
+                        y: viewport.offset.height + surface.mapFrame.midY - geo.size.height / 2)
+
+                if !compact {
+                    MapInput(
+                        zoom: { factor, point in viewport.zoom(by: factor, at: surface.localPoint(point), size: mapSize) },
+                        pan: { delta in viewport.pan(by: delta, size: mapSize) },
+                        click: { point in activate(at: surface.localPoint(point), size: mapSize) },
+                        hover: { point in
+                            model.hover(point.flatMap {
+                                RingLayout.hit(viewport.mapPoint(surface.localPoint($0), size: mapSize), size: mapSize,
+                                               slices: visibleSlices, boundaries: boundaries)
+                            })
+                        },
+                        blockedRects: surface.blockedRects
+                    ).accessibilityHidden(true)
+                }
             }
+            .clipped()
+            .overlay(alignment: .topTrailing) {
+                if !compact {
+                    HStack(spacing: 1) {
+                        SmallIconButton(symbol: "minus", help: "지도 축소", disabled: viewport.scale <= MapViewport.limits.lowerBound) {
+                            zoom(by: 1 / 1.25, size: mapSize)
+                        }
+                        Button {
+                            viewport = MapViewport()
+                            model.hover(nil)
+                        } label: {
+                            Text("\(Int((viewport.scale * 100).rounded()))%")
+                                .font(.system(size: 10, weight: .medium, design: .monospaced))
+                                .frame(width: 42, height: 27).contentShape(Rectangle())
+                        }.buttonStyle(.plain).foregroundStyle(Theme.muted)
+                            .help("원래 크기와 위치로 · 100%")
+                            .accessibilityLabel("지도 원래 크기와 위치로 복원")
+                        SmallIconButton(symbol: "plus", help: "지도 확대", disabled: viewport.scale >= MapViewport.limits.upperBound) {
+                            zoom(by: 1.25, size: mapSize)
+                        }
+                    }
+                    .padding(3).background { GlassPanel(radius: 10) }
+                    .padding(.trailing, floating ? MapSurface.sidebarWidth + 48 : 8)
+                    .padding(.top, floating ? 70 : 8)
+                }
+            }
+            .onChange(of: geo.size) { size in viewport.constrain(to: MapSurface(size: size, floating: floating).mapFrame.size) }
+            .onChange(of: focus.id) { _ in viewport = MapViewport() }
         }
-        .aspectRatio(1, contentMode: .fit)
+    }
+
+    private func zoom(by factor: CGFloat, size: CGSize) {
+        viewport.zoom(by: factor, at: CGPoint(x: size.width / 2, y: size.height / 2), size: size)
+        model.hover(nil)
+    }
+
+    private func activate(at point: CGPoint, size: CGSize) {
+        let mapped = viewport.mapPoint(point, size: size)
+        let distance = hypot(mapped.x - size.width / 2, mapped.y - size.height / 2)
+        withAnimation(reduceMotion ? nil : .easeInOut(duration: 0.20)) {
+            if distance < min(size.width, size.height) / 2 * boundaries[0] { model.up() }
+            else if let slice = RingLayout.hit(mapped, size: size, slices: visibleSlices, boundaries: boundaries) {
+                model.activate(slice)
+            } else { model.resetSelection() }
+        }
     }
 }
 
@@ -558,12 +810,15 @@ struct ContentView: View {
     @ObservedObject var model: DiskViewModel
     @State private var dropTarget = false
     var body: some View {
-        VStack(spacing: 0) {
-            toolbar
-            Rectangle().fill(Theme.line).frame(height: 1)
-            if model.scanning { ScanView(model: model) }
-            else if !model.overview, let focus = model.focus { workspace(focus) }
-            else { overview }
+        ZStack {
+            if !model.scanning, !model.overview, let focus = model.focus { workspace(focus) }
+            else {
+                VStack(spacing: 0) {
+                    toolbar
+                    if model.scanning { ScanView(model: model) }
+                    else { overview }
+                }
+            }
         }
         .background(Theme.background)
         .ignoresSafeArea(.container, edges: .top)
@@ -619,38 +874,52 @@ struct ContentView: View {
             }.buttonStyle(.plain).help("폴더 선택 · ⌘O")
         }
         .padding(.leading, 78).padding(.trailing, 18).frame(height: 51)
-        .background(Theme.toolbar)
+        .background { GlassPanel(radius: 0) }
     }
     private func workspace(_ focus: DiskNode) -> some View {
-        VStack(spacing: 0) {
-            HStack(alignment: .top, spacing: 18) {
-                VStack(spacing: 5) {
-                    HStack {
-                        Text("SPACE MAP").font(.system(size: 10, weight: .semibold)).tracking(2).foregroundStyle(Theme.muted.opacity(0.65))
-                        Spacer()
-                        Text("최대 7단계").font(.system(size: 10)).foregroundStyle(Theme.muted.opacity(0.65))
-                    }.padding(.horizontal, 24).padding(.top, 8)
-                    Spacer(minLength: 0)
-                    if focus.bytes > 0 {
-                        MapView(model: model, focus: focus)
-                            .id(focus.id).transition(.opacity.combined(with: .scale(scale: 0.95)))
-                            .frame(maxWidth: .infinity, maxHeight: .infinity)
-                    } else {
-                        VStack(spacing: 12) {
-                            Image(systemName: focus.skipped > 0 ? "lock" : "folder").font(.system(size: 35, weight: .light))
-                            Text(focus.skipped > 0 ? "이 폴더에 접근할 수 없습니다" : "표시할 파일이 없습니다").font(.subheadline)
-                        }.foregroundStyle(Theme.muted).frame(maxWidth: .infinity, maxHeight: .infinity)
-                    }
-                    Spacer(minLength: 0)
-                    HStack(spacing: 18) {
-                        Label("조각을 눌러 폴더 열기", systemImage: "cursorarrow")
-                        Label("중심을 눌러 위로", systemImage: "arrow.up")
-                    }.font(.system(size: 10)).foregroundStyle(Theme.muted.opacity(0.75)).padding(.bottom, 12)
-                }.frame(maxWidth: .infinity, maxHeight: .infinity)
-                sidebar(focus).frame(width: 316).padding(.top, 7).padding(.trailing, 12)
-            }.padding(.horizontal, 22).padding(.top, 21).padding(.bottom, 12)
-            footer(focus)
+        ZStack {
+            if focus.bytes > 0 {
+                MapView(model: model, focus: focus, floating: true)
+                    .id(focus.id).transition(.opacity)
+            } else {
+                VStack(spacing: 12) {
+                    Image(systemName: focus.skipped > 0 ? "lock" : "folder").font(.system(size: 35, weight: .light))
+                    Text(focus.skipped > 0 ? "이 폴더에 접근할 수 없습니다" : "표시할 파일이 없습니다").font(.subheadline)
+                }.foregroundStyle(Theme.muted)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .padding(.trailing, MapSurface.sidebarWidth + 32)
+            }
         }
+        .overlay(alignment: .topLeading) {
+            HStack(spacing: 12) {
+                Text("SPACE MAP").font(.system(size: 10, weight: .semibold)).tracking(2)
+                Text("최대 7단계").font(.system(size: 10))
+            }.foregroundStyle(Theme.muted)
+                .padding(.horizontal, 13).padding(.vertical, 10)
+                .background { GlassPanel(radius: 10) }
+                .padding(.leading, 24).padding(.top, 70)
+                .allowsHitTesting(false)
+        }
+        .overlay(alignment: .bottomLeading) {
+            HStack(spacing: 16) {
+                Label("조각을 눌러 폴더 열기", systemImage: "cursorarrow")
+                Label("스크롤로 확대 · 드래그로 이동", systemImage: "hand.draw")
+            }.font(.system(size: 10)).foregroundStyle(Theme.muted)
+                .padding(.horizontal, 13).padding(.vertical, 10)
+                .background { GlassPanel(radius: 10) }
+                .padding(.leading, 24).padding(.bottom, 56)
+                .allowsHitTesting(false)
+        }
+        .overlay(alignment: .trailing) {
+            sidebar(focus).padding(18)
+                .frame(width: MapSurface.sidebarWidth)
+                .background { GlassPanel(radius: 18) }
+                .shadow(color: .black.opacity(0.18), radius: 18, y: 8)
+                .padding(.top, 68).padding(.bottom, 60).padding(.trailing, 16)
+        }
+        .overlay(alignment: .top) { toolbar }
+        .overlay(alignment: .bottom) { footer(focus) }
+        .clipped()
     }
     private func sidebar(_ focus: DiskNode) -> some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -721,7 +990,7 @@ struct ContentView: View {
             }
             Text("스캔 완료 · \(Int(model.elapsed))초").foregroundStyle(Theme.muted.opacity(0.65))
         }.font(.system(size: 10)).padding(.horizontal, 26).frame(height: 44)
-            .background(Theme.toolbar.opacity(0.65))
+            .background { GlassPanel(radius: 0) }
     }
     private var overview: some View {
         VStack(alignment: .leading, spacing: 0) {

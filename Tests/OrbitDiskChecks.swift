@@ -26,6 +26,33 @@ struct Checks {
             precondition(RingLayout.path(slice, size: size).contains(p))
         }
         precondition(RingLayout.hit(CGPoint(x: 300, y: 300), size: size, slices: slices) == nil)
+        // Zoom keeps the pointer's map coordinate fixed; inverse mapping preserves hit targets after pan.
+        var viewport = MapViewport()
+        let anchor = CGPoint(x: 410, y: 245)
+        let originalPoint = viewport.mapPoint(anchor, size: size)
+        viewport.zoom(by: 2.5, at: anchor, size: size)
+        let anchoredPoint = viewport.mapPoint(anchor, size: size)
+        precondition(hypot(originalPoint.x - anchoredPoint.x, originalPoint.y - anchoredPoint.y) < 0.000001)
+        viewport.pan(by: CGSize(width: 75, height: -30), size: size)
+        for slice in slices where slice.end - slice.start > 0.000001 {
+            let angle = (slice.start + slice.end) / 2
+            let radius = 300 * (RingLayout.boundaries[slice.depth] + RingLayout.boundaries[slice.depth + 1]) / 2
+            let screenPoint = CGPoint(x: 300 + radius * cos(angle) * viewport.scale + viewport.offset.width,
+                                      y: 300 + radius * sin(angle) * viewport.scale + viewport.offset.height)
+            precondition(RingLayout.hit(viewport.mapPoint(screenPoint, size: size), size: size, slices: slices)?.id == slice.id)
+        }
+        viewport.zoom(by: 100, at: anchor, size: size)
+        precondition(viewport.scale == MapViewport.limits.upperBound)
+        viewport.zoom(by: 0.0001, at: anchor, size: size)
+        precondition(viewport.scale == MapViewport.limits.lowerBound)
+        viewport.pan(by: CGSize(width: 1e6, height: -1e6), size: size)
+        precondition(abs(viewport.offset.width) <= 402 && abs(viewport.offset.height) <= 402)
+        precondition(hypot(max(0, abs(viewport.offset.width) - 300), max(0, abs(viewport.offset.height) - 300)) <= 150 * RingLayout.boundaries.last! - 48 + 0.000001)
+        let constrained = viewport
+        viewport.zoom(by: .infinity, at: anchor, size: size)
+        precondition(viewport.scale == constrained.scale && viewport.offset == constrained.offset)
+        viewport = MapViewport()
+        precondition(viewport.scale == 1 && viewport.offset == .zero)
         let compactSize = CGSize(width: 264, height: 264)
         let compactSlices = slices.filter { $0.depth < RingLayout.compactBoundaries.count - 1 }
         for slice in compactSlices {
@@ -70,6 +97,35 @@ struct Checks {
         }
         let tiny = RingSlice(id: "tiny", node: namedFolder, parent: root, smallItems: [], bytes: 1, depth: 0, start: 0, end: 0.01)
         precondition(RingLabels.place(tiny, size: size, boundaries: RingLayout.boundaries, compact: false) == nil)
+        // A previously hidden name must appear once zoom creates enough room, without enlarging the font.
+        let zoomFolder = node("Library", children: [node("item", size: 100)])
+        let zoomSlice = RingSlice(id: "zoom-label", node: zoomFolder, parent: root, smallItems: [], bytes: 100,
+                                  depth: 4, start: 0.2, end: 0.32)
+        precondition(RingLabels.place(zoomSlice, size: CGSize(width: 900, height: 600), boundaries: RingLayout.boundaries, compact: false) == nil)
+        let zoomLabel = RingLabels.place(zoomSlice, size: CGSize(width: 2700, height: 1800), boundaries: RingLayout.boundaries, compact: false)!
+        precondition(zoomLabel.text == "Library" && zoomLabel.fontSize < 13)
+        let fullName = RingLabels.place(RingSlice(id: "full-name", node: namedFolder, parent: root, smallItems: [], bytes: 100,
+                                                 depth: 1, start: 0.2, end: 0.7),
+                                       size: CGSize(width: 3600, height: 2400), boundaries: RingLayout.boundaries, compact: false)!
+        precondition(fullName.text == namedFolder.name)
+        let wideSize = CGSize(width: 950, height: 600)
+        var wideViewport = MapViewport()
+        let wideAnchor = CGPoint(x: 750, y: 210)
+        wideViewport.zoom(by: 3, at: wideAnchor, size: wideSize)
+        precondition(hypot(wideViewport.mapPoint(wideAnchor, size: wideSize).x - wideAnchor.x,
+                           wideViewport.mapPoint(wideAnchor, size: wideSize).y - wideAnchor.y) < 0.000001)
+        // The floating canvas covers the full window, while initial framing leaves room for the sidebar.
+        let surface = MapSurface(size: CGSize(width: 1380, height: 876), floating: true)
+        let canvasCenter = CGPoint(x: surface.mapFrame.midX, y: surface.mapFrame.midY)
+        let framedCenter = MapViewport().mapPoint(surface.localPoint(canvasCenter), size: surface.mapFrame.size)
+        precondition(abs(framedCenter.x - surface.mapFrame.width / 2) < 0.000001)
+        precondition(abs(framedCenter.y - surface.mapFrame.height / 2) < 0.000001)
+        let outsideOldFrame = CGPoint(x: 5, y: 350)
+        precondition(!surface.mapFrame.contains(outsideOldFrame))
+        precondition(!surface.blockedRects.contains { $0.contains(outsideOldFrame) })
+        precondition(surface.blockedRects.contains { $0.contains(CGPoint(x: 1200, y: 400)) })
+        let compactSurface = MapSurface(size: compactSize, floating: false)
+        precondition(compactSurface.mapFrame == CGRect(origin: .zero, size: compactSize) && compactSurface.blockedRects.isEmpty)
         let model = DiskViewModel()
         model.root = root
         model.open(root)
@@ -108,6 +164,6 @@ struct Checks {
         try await Task.sleep(nanoseconds: 300_000_000)
         precondition(!model.scanning && model.root === root && model.lastScannedAt == scannedAt)
         precondition(model.scanURL == root.url)
-        print("PASS: angular coverage, aggregation, full/compact hit testing, \(labelCount) label bounds and orientations, history, scanner, cancellation, shared snapshots")
+        print("PASS: angular coverage, aggregation, full/compact hit testing, zoom anchor and transformed hit testing, adaptive zoom labels, floating canvas framing, \(labelCount) label bounds and orientations, history, scanner, cancellation, shared snapshots")
     }
 }
