@@ -581,8 +581,16 @@ private struct MapView: View {
     let focus: DiskNode
     var compact = false
     var floating = false
-    @State private var viewport = MapViewport()
+    @Binding var viewport: MapViewport
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    init(model: DiskViewModel, focus: DiskNode, compact: Bool = false, floating: Bool = false,
+         viewport: Binding<MapViewport> = .constant(MapViewport())) {
+        self.model = model
+        self.focus = focus
+        self.compact = compact
+        self.floating = floating
+        self._viewport = viewport
+    }
     private var displayedBytes: Int64 { model.hoveredSlice?.bytes ?? model.activeNode?.bytes ?? focus.bytes }
     private var boundaries: [CGFloat] { compact ? RingLayout.compactBoundaries : RingLayout.boundaries }
     private var visibleSlices: [RingSlice] { model.slices.filter { $0.depth < boundaries.count - 1 } }
@@ -706,7 +714,6 @@ private struct MapView: View {
                 }
             }
             .onChange(of: geo.size) { size in viewport.constrain(to: MapSurface(size: size, floating: floating).mapFrame.size) }
-            .onChange(of: focus.id) { _ in viewport = MapViewport() }
         }
     }
 
@@ -809,6 +816,8 @@ private struct ScanView: View {
 struct ContentView: View {
     @ObservedObject var model: DiskViewModel
     @State private var dropTarget = false
+    // Keep navigation camera state even while the chart is hidden (empty folders or rescans).
+    @State private var mapViewport = MapViewport()
     var body: some View {
         ZStack {
             if !model.scanning, !model.overview, let focus = model.focus { workspace(focus) }
@@ -879,8 +888,8 @@ struct ContentView: View {
     private func workspace(_ focus: DiskNode) -> some View {
         ZStack {
             if focus.bytes > 0 {
-                MapView(model: model, focus: focus, floating: true)
-                    .id(focus.id).transition(.opacity)
+                MapView(model: model, focus: focus, floating: true, viewport: $mapViewport)
+                    .transition(.opacity)
             } else {
                 VStack(spacing: 12) {
                     Image(systemName: focus.skipped > 0 ? "lock" : "folder").font(.system(size: 35, weight: .light))
