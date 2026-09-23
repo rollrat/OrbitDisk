@@ -139,6 +139,7 @@ private struct RingSlice: Identifiable {
 
 private enum RingLayout {
     static let boundaries: [CGFloat] = [0.145, 0.325, 0.485, 0.625, 0.745, 0.835, 0.905, 0.967]
+    static let compactBoundaries: [CGFloat] = [0.30, 0.50, 0.69, 0.84, 0.97]
     static func make(_ focus: DiskNode) -> [RingSlice] {
         var slices: [RingSlice] = []
         func walk(_ parent: DiskNode, depth: Int, start: Double, end: Double) {
@@ -165,16 +166,16 @@ private enum RingLayout {
         walk(focus, depth: 0, start: 0, end: 2 * .pi)
         return slices
     }
-    static func hit(_ point: CGPoint, size: CGSize, slices: [RingSlice]) -> RingSlice? {
+    static func hit(_ point: CGPoint, size: CGSize, slices: [RingSlice], boundaries: [CGFloat] = boundaries) -> RingSlice? {
         let radius = min(size.width, size.height) / 2
         let dx = point.x - size.width / 2, dy = point.y - size.height / 2
         let distance = hypot(dx, dy) / radius
-        guard let depth = (0..<7).first(where: { distance >= boundaries[$0] && distance < boundaries[$0 + 1] }) else { return nil }
+        guard let depth = (0..<(boundaries.count - 1)).first(where: { distance >= boundaries[$0] && distance < boundaries[$0 + 1] }) else { return nil }
         let raw = atan2(dy, dx)
         let angle = raw < 0 ? raw + 2 * .pi : raw
         return slices.first { $0.depth == depth && angle >= $0.start && angle < $0.end }
     }
-    static func path(_ slice: RingSlice, size: CGSize) -> Path {
+    static func path(_ slice: RingSlice, size: CGSize, boundaries: [CGFloat] = boundaries) -> Path {
         let center = CGPoint(x: size.width / 2, y: size.height / 2)
         let radius = min(size.width, size.height) / 2
         let inner = radius * boundaries[slice.depth]
@@ -228,6 +229,7 @@ final class DiskViewModel: ObservableObject {
     @Published var scannedFiles = 0
     @Published var scannedBytes: Int64 = 0
     @Published var elapsed: TimeInterval = 0
+    @Published private(set) var lastScannedAt: Date?
     @Published fileprivate private(set) var volumes = DiskVolume.load()
     @Published private var history: [DiskNode] = []
     @Published private var historyIndex = -1
@@ -282,12 +284,7 @@ final class DiskViewModel: ObservableObject {
                 guard let self, self.handle === current else { return }
                 self.scanning = false
                 if let result, !current.isCancelled {
-                    self.root = result
-                    self.history = []
-                    self.historyIndex = -1
-                    self.open(result)
-                    self.overview = false
-                    self.elapsed = Date().timeIntervalSince(started)
+                    self.showSnapshot(result, elapsed: Date().timeIntervalSince(started), scannedAt: Date())
                     self.volumes = DiskVolume.load()
                     self.status = "스캔 완료"
                 } else { self.status = "스캔 취소됨" }
@@ -295,6 +292,20 @@ final class DiskViewModel: ObservableObject {
         }
     }
     func cancel() { handle?.cancel() }
+    // Share the completed, immutable scan tree with another view without scanning again.
+    func showSnapshot(_ root: DiskNode, focus: DiskNode? = nil, elapsed: TimeInterval, scannedAt: Date?) {
+        handle?.cancel()
+        handle = nil
+        scanning = false
+        self.root = root
+        scanURL = root.url
+        self.elapsed = elapsed
+        lastScannedAt = scannedAt
+        history = []
+        historyIndex = -1
+        open(root)
+        if let focus, focus !== root { open(focus) }
+    }
     func open(_ node: DiskNode, record: Bool = true) {
         guard node.isDirectory else { selected = node; return }
         if record {
@@ -339,15 +350,18 @@ final class DiskViewModel: ObservableObject {
 private struct MapView: View {
     @ObservedObject var model: DiskViewModel
     let focus: DiskNode
+    var compact = false
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     private var displayedBytes: Int64 { model.hoveredSlice?.bytes ?? model.activeNode?.bytes ?? focus.bytes }
+    private var boundaries: [CGFloat] { compact ? RingLayout.compactBoundaries : RingLayout.boundaries }
+    private var visibleSlices: [RingSlice] { model.slices.filter { $0.depth < boundaries.count - 1 } }
     var body: some View {
         GeometryReader { geo in
             ZStack {
                 Canvas { context, size in
                     let active = model.activeNode
-                    for slice in model.slices {
-                        let path = RingLayout.path(slice, size: size)
+                    for slice in visibleSlices {
+                        let path = RingLayout.path(slice, size: size, boundaries: boundaries)
                         let related = active == nil || slice.node.map { $0.isRelated(to: active!) } == true
                         var layer = context
                         layer.opacity = related || model.hoveredSlice?.id == slice.id ? 1 : 0.28
@@ -356,27 +370,28 @@ private struct MapView: View {
                         if (active != nil && slice.node === active) || model.hoveredSlice?.id == slice.id {
                             layer.stroke(path, with: .color(Color.white.opacity(0.85)), lineWidth: 1.35)
                         }
+
                     }
                 }
                 .onContinuousHover { phase in
                     switch phase {
-                    case .active(let location): model.hover(RingLayout.hit(location, size: geo.size, slices: model.slices))
+                    case .active(let location): model.hover(RingLayout.hit(location, size: geo.size, slices: visibleSlices, boundaries: boundaries))
                     case .ended: model.hover(nil)
                     }
                 }
                 .gesture(SpatialTapGesture().onEnded { value in
-                    if let slice = RingLayout.hit(value.location, size: geo.size, slices: model.slices) {
+                    if let slice = RingLayout.hit(value.location, size: geo.size, slices: visibleSlices, boundaries: boundaries) {
                         withAnimation(reduceMotion ? nil : .easeInOut(duration: 0.20)) { model.activate(slice) }
                     } else { model.resetSelection() }
                 })
-                .accessibilityLabel("폴더 용량 지도. 오른쪽 목록에서 각 항목을 탐색할 수 있습니다.")
+                .accessibilityLabel("폴더 용량 지도. 목록에서도 각 항목을 탐색할 수 있습니다.")
                 Button {
                     withAnimation(reduceMotion ? nil : .easeInOut(duration: 0.20)) { model.up() }
                 } label: {
                     VStack(spacing: 3) {
                         let parts = sizeParts(displayedBytes)
                         Text(parts.0)
-                            .font(.system(size: min(23, geo.size.width * 0.038), weight: .medium, design: .rounded))
+                            .font(.system(size: compact ? 21 : min(23, geo.size.width * 0.038), weight: .medium, design: .rounded))
                             .minimumScaleFactor(0.65).lineLimit(1)
                         Text(parts.1).font(.system(size: 11)).foregroundStyle(Theme.muted)
                         if focus.parent != nil {
@@ -384,8 +399,8 @@ private struct MapView: View {
                         }
                     }
                     .foregroundStyle(model.activeNode.map { model.color(for: $0) } ?? Theme.accent)
-                    .frame(width: min(geo.size.width, geo.size.height) * 0.135,
-                           height: min(geo.size.width, geo.size.height) * 0.135)
+                    .frame(width: min(geo.size.width, geo.size.height) * (compact ? 0.28 : 0.135),
+                           height: min(geo.size.width, geo.size.height) * (compact ? 0.28 : 0.135))
                     .background(Circle().fill(Theme.background))
                     .contentShape(Circle())
                 }
@@ -477,7 +492,7 @@ private struct ScanView: View {
 }
 
 struct ContentView: View {
-    @StateObject private var model = DiskViewModel()
+    @ObservedObject var model: DiskViewModel
     @State private var dropTarget = false
     var body: some View {
         VStack(spacing: 0) {
@@ -705,9 +720,138 @@ struct ContentView: View {
     }
 }
 
+private struct HomeMenuView: View {
+    @ObservedObject var model: DiskViewModel
+    @ObservedObject var windowModel: DiskViewModel
+    @Environment(\.openWindow) private var openWindow
+    private let home = FileManager.default.homeDirectoryForCurrentUser
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 9) {
+                Image(systemName: "chart.pie.fill").foregroundStyle(Theme.accent)
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("OrbitDisk").font(.system(size: 14, weight: .semibold))
+                    Text("홈 폴더 · \(home.lastPathComponent)").font(.system(size: 10)).foregroundStyle(Theme.muted)
+                }
+                Spacer()
+                if model.scanning {
+                    SmallIconButton(symbol: "xmark", help: "홈 폴더 스캔 취소") { model.cancel() }
+                } else {
+                    SmallIconButton(symbol: "arrow.clockwise", help: "홈 폴더 다시 스캔") { model.start(home) }
+                }
+                Menu {
+                    Button("Finder에서 홈 폴더 열기") { NSWorkspace.shared.open(home) }
+                    Divider()
+                    Button("OrbitDisk 종료") { NSApp.terminate(nil) }
+                } label: { Image(systemName: "ellipsis").frame(width: 20, height: 24) }
+                .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize()
+                .accessibilityLabel("OrbitDisk 메뉴")
+            }.padding(.horizontal, 18).padding(.vertical, 14)
+            Rectangle().fill(Theme.line).frame(height: 1)
+
+            VStack(spacing: 8) {
+                HStack(spacing: 7) {
+                    Button {
+                        if let root = model.root { model.open(root) }
+                    } label: { Label("홈", systemImage: "house") }
+                    .buttonStyle(.plain).foregroundStyle(Theme.accent)
+                    .disabled(model.root == nil || model.scanning)
+                    if let focus = model.focus, focus !== model.root {
+                        Image(systemName: "chevron.right").foregroundStyle(Theme.muted)
+                        Text(focus.name).lineLimit(1).truncationMode(.middle)
+                        Spacer(minLength: 0)
+                        SmallIconButton(symbol: "arrow.up", help: "상위 폴더") { model.up() }
+                            .disabled(model.scanning)
+                    } else { Spacer() }
+                    Text("읽힌 파일 합계").foregroundStyle(Theme.muted)
+                }.font(.system(size: 11)).frame(height: 26)
+
+                if let focus = model.focus {
+                    MapView(model: model, focus: focus, compact: true)
+                        .frame(width: 236, height: 236)
+                        .opacity(model.scanning ? 0.3 : 1)
+                        .allowsHitTesting(!model.scanning)
+                        .overlay { if model.scanning { ProgressView().controlSize(.small) } }
+                    Text(model.hoveredSlice?.name ?? model.activeNode?.name ?? (focus === model.root ? "홈 폴더" : focus.name))
+                        .font(.system(size: 12, weight: .medium)).lineLimit(1).truncationMode(.middle)
+                        .frame(height: 18)
+                    HStack {
+                        Text(model.smallItems == nil ? "용량이 큰 항목" : "작은 항목")
+                        Spacer()
+                        Text("\(model.listedItems.count.formatted())개")
+                    }.font(.system(size: 10)).foregroundStyle(Theme.muted).padding(.top, 4)
+                    VStack(spacing: 1) {
+                        ForEach(model.listedItems.prefix(4)) { FileRow(model: model, node: $0) }
+                        if model.listedItems.isEmpty {
+                            Text(focus.skipped > 0 ? "접근 권한이 필요한 폴더입니다" : "표시할 파일이 없습니다")
+                                .font(.system(size: 12)).foregroundStyle(Theme.muted).padding(.vertical, 24)
+                        }
+                    }.disabled(model.scanning)
+                } else {
+                    VStack(spacing: 14) {
+                        if model.scanning {
+                            ProgressView().controlSize(.small)
+                            Text("홈 폴더를 살펴보는 중").font(.system(size: 15, weight: .medium))
+                            Text("\(model.scannedFiles.formatted())개 파일 · \(formattedSize(model.scannedBytes))")
+                                .font(.system(size: 12, design: .rounded)).foregroundStyle(Theme.accent)
+                            Text("메뉴를 닫아도 스캔은 계속됩니다")
+                                .font(.system(size: 11)).foregroundStyle(Theme.muted)
+                        } else {
+                            Image(systemName: "house.circle").font(.system(size: 48, weight: .ultraLight)).foregroundStyle(Theme.accent)
+                            Text("홈 폴더의 공간을 한눈에").font(.system(size: 15, weight: .medium))
+                            Button("홈 폴더 스캔") { model.start(home) }.buttonStyle(.bordered)
+                        }
+                    }.frame(maxWidth: .infinity, maxHeight: .infinity)
+                }
+                Spacer(minLength: 0)
+                HStack(spacing: 4) {
+                    if model.scanning {
+                        Text("스캔 중 · \(model.scannedFiles.formatted())개 파일")
+                    } else if let date = model.lastScannedAt {
+                        Text("업데이트")
+                        Text(date, style: .time)
+                    } else { Text("홈 폴더만 스캔합니다") }
+                    Spacer(minLength: 0)
+                    if let root = model.root, root.skipped > 0 {
+                        Label("제한 \(root.skipped)개", systemImage: "lock")
+                            .help("읽지 못한 항목은 합계에서 제외됩니다. 전체 디스크 사용량과 다릅니다.")
+                    }
+                }.font(.system(size: 10)).foregroundStyle(Theme.muted)
+            }.padding(.horizontal, 18).padding(.vertical, 12)
+
+            Rectangle().fill(Theme.line).frame(height: 1)
+            Button(action: showMainWindow) {
+                HStack {
+                    Text("큰 창에서 보기")
+                    Spacer()
+                    Image(systemName: "arrow.up.forward.square")
+                }.font(.system(size: 12, weight: .medium)).foregroundStyle(Theme.accent)
+                    .padding(.horizontal, 20).frame(height: 45).contentShape(Rectangle())
+            }.buttonStyle(.plain)
+        }
+        .frame(width: 360, height: 620)
+        .background(Theme.background).preferredColorScheme(.dark)
+        .onAppear {
+            if model.root == nil && !model.scanning { model.start(home) }
+            else if let root = model.root, !model.scanning { model.open(root) }
+        }
+        .onDisappear { model.resetSelection() }
+    }
+
+    private func showMainWindow() {
+        if let root = model.root {
+            windowModel.showSnapshot(root, focus: model.focus, elapsed: model.elapsed, scannedAt: model.lastScannedAt)
+        }
+        openWindow(id: "main")
+        NSApp.activate(ignoringOtherApps: true)
+    }
+}
+
 #if !TESTING
 @MainActor
 final class OrbitDiskAppDelegate: NSObject, NSApplicationDelegate {
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
     func applicationDidFinishLaunching(_ notification: Notification) {
         // Set the running app's Dock image as well as its bundle icon. This
         // refreshes icons cached from earlier locally built app bundles.
@@ -723,11 +867,17 @@ final class OrbitDiskAppDelegate: NSObject, NSApplicationDelegate {
 @main
 struct OrbitDiskApp: App {
     @NSApplicationDelegateAdaptor(OrbitDiskAppDelegate.self) private var appDelegate
+    @StateObject private var windowModel = DiskViewModel()
+    @StateObject private var homeModel = DiskViewModel()
 
     var body: some Scene {
-        WindowGroup("OrbitDisk") { ContentView() }
+        Window("OrbitDisk", id: "main") { ContentView(model: windowModel) }
             .windowStyle(.hiddenTitleBar)
             .defaultSize(width: 1100, height: 740)
+        MenuBarExtra("OrbitDisk", systemImage: "chart.pie") {
+            HomeMenuView(model: homeModel, windowModel: windowModel)
+        }
+        .menuBarExtraStyle(.window)
     }
 }
 #endif

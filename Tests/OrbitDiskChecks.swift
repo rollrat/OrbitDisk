@@ -1,6 +1,6 @@
 @main
 struct Checks {
-    @MainActor static func main() throws {
+    @MainActor static func main() async throws {
         func node(_ name: String, size: Int64 = 0, children: [DiskNode] = []) -> DiskNode {
             let n = DiskNode(url: URL(fileURLWithPath: "/tmp/" + name), isDirectory: !children.isEmpty)
             n.children = children.sorted { $0.bytes > $1.bytes }
@@ -26,6 +26,16 @@ struct Checks {
             precondition(RingLayout.path(slice, size: size).contains(p))
         }
         precondition(RingLayout.hit(CGPoint(x: 300, y: 300), size: size, slices: slices) == nil)
+        let compactSize = CGSize(width: 264, height: 264)
+        let compactSlices = slices.filter { $0.depth < RingLayout.compactBoundaries.count - 1 }
+        for slice in compactSlices {
+            let angle = (slice.start + slice.end) / 2
+            let radius = 132 * (RingLayout.compactBoundaries[slice.depth] + RingLayout.compactBoundaries[slice.depth + 1]) / 2
+            let point = CGPoint(x: 132 + radius * cos(angle), y: 132 + radius * sin(angle))
+            precondition(RingLayout.hit(point, size: compactSize, slices: compactSlices, boundaries: RingLayout.compactBoundaries)?.id == slice.id)
+            precondition(RingLayout.path(slice, size: compactSize, boundaries: RingLayout.compactBoundaries).contains(point))
+        }
+        precondition(RingLayout.hit(CGPoint(x: 132, y: 132), size: compactSize, slices: compactSlices, boundaries: RingLayout.compactBoundaries) == nil)
         var chain = node("end", size: 100)
         for i in 0..<10 { chain = node("depth\(i)", children: [chain]) }
         precondition(RingLayout.make(chain).count == 7)
@@ -56,6 +66,17 @@ struct Checks {
         precondition(scan.bytes == scan.children.reduce(0) { $0 + $1.bytes })
         let cancelled = ScanHandle(); cancelled.cancel()
         precondition(FolderScanner.scan(fixture, handle: cancelled) { _,_,_ in } == nil)
-        print("PASS: angular coverage, aggregation, 7-level depth, drawn-path hit testing, history, parent navigation, search, scanner parent links, symlink cycle, cancellation")
+        let menuModel = DiskViewModel()
+        let scannedAt = Date()
+        menuModel.showSnapshot(root, focus: folder, elapsed: 5, scannedAt: scannedAt)
+        model.start(fixture)
+        model.showSnapshot(root, focus: folder, elapsed: menuModel.elapsed, scannedAt: menuModel.lastScannedAt)
+        precondition(model.root === root && model.focus === folder && model.canBack)
+        model.up()
+        precondition(menuModel.focus === folder && model.focus === root)
+        try await Task.sleep(nanoseconds: 300_000_000)
+        precondition(!model.scanning && model.root === root && model.lastScannedAt == scannedAt)
+        precondition(model.scanURL == root.url)
+        print("PASS: angular coverage, aggregation, full/compact hit testing, history, scanner, cancellation, shared snapshots")
     }
 }
