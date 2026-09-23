@@ -39,6 +39,37 @@ struct Checks {
         var chain = node("end", size: 100)
         for i in 0..<10 { chain = node("depth\(i)", children: [chain]) }
         precondition(RingLayout.make(chain).count == 7)
+        let namedFolder = node("Downloads-and-프로젝트-자료", children: [node("contents", size: 100)])
+        var labelCount = 0
+        for compact in [false, true] {
+            let bounds = compact ? RingLayout.compactBoundaries : RingLayout.boundaries
+            let canvasSize = CGSize(width: compact ? 236 : 600, height: compact ? 236 : 600)
+            let labelFolder = compact ? node("Library", children: [node("contents", size: 100)]) : namedFolder
+            var surfaceLabels = 0
+            for depth in 0..<(bounds.count - 1) {
+                for span in [0.015, 0.12, 0.5, 1.2, 4.0, 2 * Double.pi] {
+                    for start in stride(from: 0.0, through: 2 * .pi - span, by: 0.4) {
+                        let slice = RingSlice(id: "label", node: labelFolder, parent: root, smallItems: [], bytes: 100,
+                                              depth: depth, start: start, end: start + span)
+                        guard let label = RingLabels.place(slice, size: canvasSize, boundaries: bounds, compact: compact) else { continue }
+                        precondition(abs(label.rotation) <= .pi / 2 + 0.000001)
+                        let path = RingLayout.path(slice, size: canvasSize, boundaries: bounds)
+                        for x in [-label.measuredSize.width / 2, label.measuredSize.width / 2] {
+                            for y in [-label.measuredSize.height / 2, label.measuredSize.height / 2] {
+                                let point = CGPoint(x: label.center.x + x * cos(label.rotation) - y * sin(label.rotation),
+                                                    y: label.center.y + x * sin(label.rotation) + y * cos(label.rotation))
+                                precondition(path.contains(point), "Label crosses slice boundary")
+                            }
+                        }
+                        surfaceLabels += 1
+                    }
+                }
+            }
+            precondition(surfaceLabels > 0)
+            labelCount += surfaceLabels
+        }
+        let tiny = RingSlice(id: "tiny", node: namedFolder, parent: root, smallItems: [], bytes: 1, depth: 0, start: 0, end: 0.01)
+        precondition(RingLabels.place(tiny, size: size, boundaries: RingLayout.boundaries, compact: false) == nil)
         let model = DiskViewModel()
         model.root = root
         model.open(root)
@@ -77,6 +108,6 @@ struct Checks {
         try await Task.sleep(nanoseconds: 300_000_000)
         precondition(!model.scanning && model.root === root && model.lastScannedAt == scannedAt)
         precondition(model.scanURL == root.url)
-        print("PASS: angular coverage, aggregation, full/compact hit testing, history, scanner, cancellation, shared snapshots")
+        print("PASS: angular coverage, aggregation, full/compact hit testing, \(labelCount) label bounds and orientations, history, scanner, cancellation, shared snapshots")
     }
 }

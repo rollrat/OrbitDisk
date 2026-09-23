@@ -188,6 +188,63 @@ private enum RingLayout {
     }
 }
 
+private enum RingLabels {
+    struct Placement {
+        let text: String
+        let fontSize: CGFloat
+        let center: CGPoint
+        let rotation: Double
+        let measuredSize: CGSize
+    }
+
+    static func place(_ slice: RingSlice, size: CGSize, boundaries: [CGFloat], compact: Bool) -> Placement? {
+        guard let node = slice.node, node.isDirectory, slice.depth < boundaries.count - 1 else { return nil }
+        let radius = min(size.width, size.height) / 2
+        let inner = radius * boundaries[slice.depth]
+        let outer = radius * boundaries[slice.depth + 1]
+        let middle = (inner + outer) / 2
+        let padding: CGFloat = compact ? 3 : 4
+        let fontSize: CGFloat = compact ? 9 : max(9, 12 - CGFloat(slice.depth) * 0.7)
+        let font = NSFont.systemFont(ofSize: fontSize, weight: .medium)
+        let attributes: [NSAttributedString.Key: Any] = [.font: font]
+        let textHeight = ceil(font.ascender - font.descender + font.leading)
+        guard outer - inner >= textHeight + 2 * padding else { return nil }
+
+        // Fit a straight, tangential label inside both circular edges and both
+        // angular edges. Arc length alone would let long labels cross rings.
+        let halfHeight = textHeight / 2
+        let radialWidth = 2 * sqrt(max(0, pow(outer - padding, 2) - pow(middle + halfHeight, 2)))
+        let halfAngle = min((slice.end - slice.start) / 2, .pi / 2 - 0.001)
+        let angularWidth = 2 * (middle - halfHeight) * tan(halfAngle) - 2 * padding
+        let availableWidth = min(radialWidth, angularWidth)
+        guard availableWidth >= 22 else { return nil }
+        var text = node.name
+        var width = ceil((text as NSString).size(withAttributes: attributes).width)
+        if width > availableWidth {
+            // Keep short names intact; only abbreviate if a useful prefix fits.
+            guard availableWidth >= 48 else { return nil }
+            let characters = Array(text)
+            var count = min(characters.count - 1, 48)
+            while count >= 5 {
+                text = String(characters.prefix(count)) + "…"
+                width = ceil((text as NSString).size(withAttributes: attributes).width)
+                if width <= availableWidth { break }
+                count -= 1
+            }
+            guard count >= 5, width <= availableWidth else { return nil }
+        }
+        let angle = (slice.start + slice.end) / 2
+        var rotation = (angle + .pi / 2).truncatingRemainder(dividingBy: 2 * .pi)
+        if rotation > .pi { rotation -= 2 * .pi }
+        if rotation > .pi / 2 { rotation -= .pi }
+        if rotation < -.pi / 2 { rotation += .pi }
+        return Placement(text: text, fontSize: fontSize,
+                         center: CGPoint(x: size.width / 2 + middle * cos(angle),
+                                         y: size.height / 2 + middle * sin(angle)),
+                         rotation: rotation, measuredSize: CGSize(width: width, height: textHeight))
+    }
+}
+
 private struct DiskVolume: Identifiable {
     let url: URL
     let scanURL: URL
@@ -370,7 +427,13 @@ private struct MapView: View {
                         if (active != nil && slice.node === active) || model.hoveredSlice?.id == slice.id {
                             layer.stroke(path, with: .color(Color.white.opacity(0.85)), lineWidth: 1.35)
                         }
-
+                        if let label = RingLabels.place(slice, size: size, boundaries: boundaries, compact: compact) {
+                            layer.clip(to: path)
+                            layer.translateBy(x: label.center.x, y: label.center.y)
+                            layer.rotate(by: .radians(label.rotation))
+                            layer.draw(Text(label.text).font(.system(size: label.fontSize, weight: .medium))
+                                .foregroundColor(Theme.background.opacity(0.95)), at: .zero, anchor: .center)
+                        }
                     }
                 }
                 .onContinuousHover { phase in
